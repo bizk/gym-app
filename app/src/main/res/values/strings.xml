@@ -1,0 +1,5 @@
+<resources>
+    <string name="rest_running">Descansando</string>
+    <string name="rest_ready">Listo para seguir</string>
+    <string name="rest_offer_countdown">Seguimos en %1$d s</string>
+</resources>
