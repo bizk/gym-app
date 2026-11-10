@@ -1,1 +1,15 @@
-<manifest xmlns:android="http://schemas.android.com/apk/res/android"><uses-feature android:name="android.hardware.type.watch" android:required="true"/><application><activity android:name=".MainActivity" android:taskAffinity=""/><meta-data android:name="com.google.android.wearable.standalone" android:value="false"/></application></manifest>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+    <uses-feature android:name="android.hardware.type.watch" android:required="true"/>
+    <uses-permission android:name="android.permission.WAKE_LOCK"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE"/>
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE"/>
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS"/>
+    <application>
+        <uses-library android:name="com.google.android.wearable" android:required="false"/>
+        <activity android:name=".MainActivity" android:taskAffinity="" android:launchMode="singleTask"/>
+        <service android:name=".Ongoing" android:exported="false" android:foregroundServiceType="specialUse">
+            <property android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE" android:value="Keeps an open gym session in front of the watch face while training"/>
+        </service>
+        <meta-data android:name="com.google.android.wearable.standalone" android:value="false"/>
+    </application>
+</manifest>
