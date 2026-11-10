@@ -60,4 +60,31 @@ public class PlanProgressTest {
         state.put("plans", new JSONArray().put(plan).put(plan("6° Plan")));
         assertEquals(0, count(state, plan));
     }
+
+    @Test public void currentShowsLatestWorkedEntry() {
+        assertEquals(0, PlanProgress.current(new int[]{0, 0, 0, 0, 0}));
+        assertEquals(3, PlanProgress.current(new int[]{2, 2, 2, 1, 0}));
+        assertEquals(3, PlanProgress.current(new int[]{2, 0, 1, 1, 0}));
+    }
+
+    @Test public void currentMovesPastCompletedEntry() {
+        assertEquals(4, PlanProgress.current(new int[]{2, 2, 2, 2, 0}));
+        assertEquals(4, PlanProgress.current(new int[]{2, 2, 2, 2, 2}));
+        assertEquals(1, PlanProgress.current(new int[]{2, 0, 0}));
+    }
+
+    @Test public void weekStatusCombinesDays() {
+        assertEquals(2, PlanProgress.weekStatus(new int[]{2, 2}));
+        assertEquals(1, PlanProgress.weekStatus(new int[]{2, 0}));
+        assertEquals(0, PlanProgress.weekStatus(new int[]{0, 0}));
+    }
+
+    @Test public void partialSetsCountAsStarted() throws Exception {
+        JSONObject plan = plan("Plan 1");
+        JSONObject state = new JSONObject().put("plans", new JSONArray().put(plan))
+                .put("history", new JSONArray().put(session("Plan 1", 1, 1, 0)));
+        JSONObject day = Store.array(plan, "days").optJSONObject(0);
+        assertEquals(1, PlanProgress.dayStatus(state, plan, day, 0));
+        assertEquals(0, PlanProgress.dayStatus(state, plan, day, 1));
+    }
 }

@@ -87,4 +87,41 @@ final class PlanProgress {
         for (boolean complete : done) if (complete) count++;
         return count;
     }
+
+    /** True when any session for this plan/day/week recorded at least one set. */
+    static boolean started(JSONObject state, JSONObject plan, JSONObject day, int week) {
+        JSONArray history = Store.array(state, "history");
+        for (int i = 0; i <= history.length(); i++) {
+            JSONObject session = i < history.length() ? history.optJSONObject(i) : state.optJSONObject("active");
+            if (!matches(state, session, plan, day, week)) continue;
+            JSONArray items = Store.array(session, "items");
+            for (int e = 0; e < items.length(); e++)
+                if (Store.array(items.optJSONObject(e), "done").length() > 0) return true;
+        }
+        return false;
+    }
+
+    /** 2 = every exercise completed, 1 = some work recorded, 0 = untouched. */
+    static int dayStatus(JSONObject state, JSONObject plan, JSONObject day, int week) {
+        int total = Store.array(day, "exercises").length();
+        int count = completed(state, plan, day, week);
+        if (total > 0 && count == total) return 2;
+        return count > 0 || started(state, plan, day, week) ? 1 : 0;
+    }
+
+    static int weekStatus(int[] days) {
+        boolean all = days.length > 0, any = false;
+        for (int day : days) { all &= day == 2; any |= day > 0; }
+        return all ? 2 : any ? 1 : 0;
+    }
+
+    /**
+     * The entry to show by default: the last one with recorded work, or the one after it when that
+     * one is already complete. Untouched sequences start at the first entry.
+     */
+    static int current(int[] status) {
+        for (int i = status.length - 1; i >= 0; i--)
+            if (status[i] > 0) return status[i] == 2 ? Math.min(i + 1, status.length - 1) : i;
+        return 0;
+    }
 }

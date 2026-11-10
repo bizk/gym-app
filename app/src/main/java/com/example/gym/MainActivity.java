@@ -9,7 +9,7 @@ import android.widget.*;
 import org.json.*;
 import java.util.*;
 
-public class MainActivity extends Activity {
+public class MainActivity extends androidx.activity.ComponentActivity {
     private JSONObject state;
     private TrainingUi ui;
     private int plan, day, week, exercise;
@@ -22,6 +22,12 @@ public class MainActivity extends Activity {
     private int restExercise = -1;
     private long restOfferUntil;
     private boolean restAdvance;
+    /** Direction of the next exercise transition (-1 back, 1 forward), and the set just recorded. */
+    private int slide, justCompleted = -1;
+    /** Week and day shown on the phone home; -1 picks the current one from recorded progress. */
+    private int homeWeek = -1, homeDay = -1;
+    /** Plan chosen on the watch picker; -1 opens on the latest imported plan. */
+    private int homePlan = -1;
 
     @Override public void onCreate(Bundle saved) {
         super.onCreate(saved);
@@ -33,6 +39,11 @@ public class MainActivity extends Activity {
         else getWindow().getDecorView().setSystemUiVisibility(View.SYSTEM_UI_FLAG_LAYOUT_STABLE
                 | View.SYSTEM_UI_FLAG_LAYOUT_FULLSCREEN | View.SYSTEM_UI_FLAG_LAYOUT_HIDE_NAVIGATION);
         state = Store.read(this);
+        if (watch) Ambient.attach(this, new Ambient.Listener() {
+            public void enter() { ui.ambient(ambientSummary()); }
+            public void update() { ui.ambient(ambientSummary()); }
+            public void exit() { ui.ambient(null); if (page.equals("rest")) showRest(); }
+        });
         if (saved != null) {
             page = saved.getString("page", "home");
             restUntil = saved.getLong("restUntil");
@@ -41,9 +52,13 @@ public class MainActivity extends Activity {
             restOfferUntil = saved.getLong("restOfferUntil");
             restAdvance = saved.getBoolean("restAdvance");
             selectedPlan = saved.getString("selectedPlan");
-            week = saved.getInt("selectedWeek");
+            homeWeek = saved.getInt("homeWeek", -1);
+            homeDay = saved.getInt("homeDay", -1);
+            homePlan = saved.getInt("homePlan", -1);
         }
         render();
+        if (watch && saved == null && active() != null) Ongoing.ask(this);
+        syncOngoing();
     }
 
     @Override protected void onSaveInstanceState(Bundle out) {
@@ -55,7 +70,9 @@ public class MainActivity extends Activity {
         out.putLong("restOfferUntil", restOfferUntil);
         out.putBoolean("restAdvance", restAdvance);
         out.putString("selectedPlan", selectedPlan);
-        out.putInt("selectedWeek", week);
+        out.putInt("homeWeek", homeWeek);
+        out.putInt("homeDay", homeDay);
+        out.putInt("homePlan", homePlan);
     }
 
     @Override protected void onResume() {
@@ -83,14 +100,60 @@ public class MainActivity extends Activity {
             case "feeling": workout(); break;
             case "restOffer": showRestOffer(); break;
             case "exercises": exercises(); break;
+            case "edit": editExercise(); break;
+            case "pickPlan": pickPlanWatch(); break;
+            case "pickWeek": pickWeek(); break;
+            case "pickDay": pickDay(); break;
             default: home();
         }
     }
 
-    private void screen(String name) { stopTicker(); page = name; ui.screen(); }
+    private void screen(String name) {
+        stopTicker(); page = name; ui.screen();
+        ui.swipeBack(this::goBack);
+    }
+
+    /** One step back from the current screen; from home it leaves the app. */
+    private void goBack() {
+        switch (page) {
+            case "home": finish(); break;
+            case "rest": case "restOffer": continueAfterExercise(); break;
+            case "feeling": dismissFeeling(); break;
+            case "options": if (!ui.closeOverlay()) workout(); break;
+            case "edit": hideKeyboard(); workout(); break;
+            case "exercises": workout(); break;
+            case "pickPlan": home(); break;
+            case "pickWeek": pickPlanWatch(); break;
+            case "pickDay": pickWeek(); break;
+            case "history": if (watch && active() != null) workout(); else home(); break;
+            default: home();
+        }
+    }
+
+    @SuppressWarnings({"deprecation", "MissingSuperCall"})
+    @Override public void onBackPressed() { goBack(); }
+
+    private String ambientSummary() {
+        JSONObject session = active();
+        if (session == null || items().length() == 0) return "Mi entrenamiento";
+        JSONObject e = current();
+        String top = session.optString("name") + " · S" + session.optInt("week");
+        if (page.equals("rest")) return top + "\nDescanso";
+        return top + "\n" + e.optString("name") + "\n" + Store.array(e, "done").length() + "/" + e.optInt("sets") + " series";
+    }
     private void persist() {
         try { state.put("revision", System.currentTimeMillis()); Store.save(this, state, true); }
         catch (Exception e) { error(e); }
+        syncOngoing();
+    }
+
+    /** Watch: an open session is an ongoing activity, so waking the watch returns here. */
+    private void syncOngoing() {
+        if (!watch) return;
+        JSONObject session = active();
+        if (session == null) { Ongoing.stop(this); return; }
+        String detail = items().length() == 0 ? "" : current().optString("name");
+        Ongoing.update(this, session.optString("name") + " · Semana " + session.optInt("week"), detail);
     }
     private void error(Exception e) { Toast.makeText(this, e.getMessage() == null ? "No se pudo completar" : e.getMessage(), Toast.LENGTH_LONG).show(); }
     private JSONObject obj(JSONArray array, int index) { return array.optJSONObject(index); }
@@ -115,94 +178,207 @@ public class MainActivity extends Activity {
     }
 
     private void home() {
+        if (!watch) { phoneHome(); return; }
         screen("home");
-        ui.eyebrow("MI ENTRENAMIENTO");
-        ui.title(active() == null ? "Vamos a entrenar." : "Seguí a tu ritmo.");
-        if (active() != null) {
-            JSONObject session = active();
+        JSONObject session = active();
+        if (session != null) {
             JSONArray list = items();
-            if (watch) {
-                ui.muted(session.optString("name") + " · S" + session.optInt("week"));
-                ui.progress(completed(list), total(list));
-            } else {
-                LinearLayout card = ui.card();
-                ui.cardText(card, "SESIÓN EN CURSO", 12, TrainingUi.ACCENT, true);
-                ui.cardText(card, session.optString("name"), 24, TrainingUi.TEXT, true);
-                ui.cardText(card, "Semana " + session.optInt("week") + " · " + completed(list) + " de " + total(list) + " series", 15, TrainingUi.MUTED, false);
-            }
-            ui.button("Continuar sesión", true, this::workout);
-        } else if (plans().length() > 0) {
-            ui.muted(watch ? "Tu plan está listo." : "Tu plan está listo. Elegí el día y empezá tu próxima sesión.");
-            if (watch) ui.button("Empezar sesión", true, this::choosePlan);
-        } else {
-            ui.muted(watch ? "Importá tu plan en el teléfono para comenzar." : "Tu próximo entrenamiento empieza acá. Importá el Excel de tu entrenador.");
-        }
-        if (!watch) {
-            if (plans().length() > 0) planOverview();
-            ui.gap(12);
-            ui.eyebrow("TU ESPACIO");
-            ui.button(plans().length() > 0 ? "Actualizar plan · Excel" : "Importar plan · Excel", plans().length() == 0, this::importPlan);
-        }
-        ui.button("Historial", false, this::history);
-        if (!watch) {
-            ui.gap(16);
-            ui.muted("Sin conexión, sin distracciones. Tu progreso se guarda en este dispositivo.");
-        }
+            int done = completed(list), all = total(list);
+            ui.watchHome("SEMANA " + session.optInt("week"), title(session.optString("name")),
+                    done + " / " + all + " series", (float) done / Math.max(1, all),
+                    "Continuar sesión", this::workout, this::history);
+        } else if (plans().length() > 0)
+            ui.watchHome("TU PLAN", "Entrenar", "Elegí semana y día", 0, "Empezar sesión",
+                    () -> { homePlan = -1; homeWeek = -1; homeDay = -1; pickPlanWatch(); }, this::history);
+        else ui.watchHome("TU PLAN", "Entrenar", "Importalo en el teléfono", 0, null, null, this::history);
     }
 
-    private void planOverview() {
+    /** Status of every day of every week in the plan: 2 complete, 1 started, 0 untouched. */
+    private int[][] dayMatrix(JSONObject month) {
+        JSONArray days = Store.array(month, "days");
+        int[][] status = new int[PlanProgress.weeks(month)][days.length()];
+        for (int w = 0; w < status.length; w++)
+            for (int d = 0; d < days.length(); d++) status[w][d] = PlanProgress.dayStatus(state, month, obj(days, d), w);
+        return status;
+    }
+
+    private JSONObject watchPlan() {
+        if (homePlan < 0 || homePlan >= plans().length()) homePlan = PlanProgress.latest(plans());
+        plan = homePlan;
+        return obj(plans(), plan);
+    }
+
+    /** Watch step 1: choose the plan, opening on the latest one. */
+    private void pickPlanWatch() {
+        if (active() != null) { workout(); return; }
+        if (plans().length() == 0) { home(); return; }
+        JSONObject month = watchPlan();
+        // Arrows follow the plan number: ‹ older, › newer, whatever the import order.
+        List<Integer> order = new ArrayList<>();
+        for (int i = 0; i < plans().length(); i++) order.add(i);
+        order.sort(Comparator.comparingInt(i -> planNumber(obj(plans(), i).optString("name"))));
+        int at = order.indexOf(homePlan);
+        int[][] status = dayMatrix(month);
+        int[] weeks = new int[status.length];
+        for (int w = 0; w < status.length; w++) weeks[w] = PlanProgress.weekStatus(status[w]);
+        int overall = weeks.length == 0 ? 0 : PlanProgress.weekStatus(weeks);
+        String name = month.optString("name");
+        java.util.regex.Matcher number = java.util.regex.Pattern.compile("(\\d+)").matcher(name);
+        screen("pickPlan");
+        ui.watchPicker("PLAN", number.find() ? number.group(1) : title(name), statusLabel(overall), statusColor(overall), weeks,
+                at > 0 ? () -> { homePlan = order.get(at - 1); homeWeek = -1; homeDay = -1; slide = -1; pickPlanWatch(); } : null,
+                at < order.size() - 1 ? () -> { homePlan = order.get(at + 1); homeWeek = -1; homeDay = -1; slide = 1; pickPlanWatch(); } : null,
+                R.drawable.ic_chevron_right, "Elegir " + name, () -> { homeWeek = -1; homeDay = -1; slide = 1; pickWeek(); });
+        ui.slideIn(slide); slide = 0;
+    }
+
+    /** Watch step 1: choose the week, opening on the current one. */
+    private void pickWeek() {
+        if (active() != null) { workout(); return; }
+        if (plans().length() == 0) { home(); return; }
+        int[][] status = dayMatrix(watchPlan());
+        if (status.length == 0 || status[0].length == 0) { home(); return; }
+        int[] weeks = new int[status.length];
+        for (int w = 0; w < status.length; w++) weeks[w] = PlanProgress.weekStatus(status[w]);
+        if (homeWeek < 0 || homeWeek >= status.length) homeWeek = PlanProgress.current(weeks);
+        int w = homeWeek;
+        screen("pickWeek");
+        ui.watchPicker("SEMANA", String.valueOf(w + 1), statusLabel(weeks[w]), statusColor(weeks[w]), status[w],
+                w > 0 ? () -> { homeWeek = w - 1; homeDay = -1; slide = -1; pickWeek(); } : null,
+                w < status.length - 1 ? () -> { homeWeek = w + 1; homeDay = -1; slide = 1; pickWeek(); } : null,
+                R.drawable.ic_chevron_right, "Elegir semana " + (w + 1), () -> { homeDay = -1; slide = 1; pickDay(); });
+        ui.slideIn(slide); slide = 0;
+    }
+
+    /** Watch step 2: choose the day within the chosen week, then start it. */
+    private void pickDay() {
+        if (active() != null) { workout(); return; }
+        if (plans().length() == 0) { home(); return; }
+        JSONObject month = watchPlan();
+        int[][] status = dayMatrix(month);
+        if (homeWeek < 0 || homeWeek >= status.length || status[homeWeek].length == 0) { pickWeek(); return; }
+        int w = homeWeek;
+        if (homeDay < 0 || homeDay >= status[w].length) homeDay = PlanProgress.current(status[w]);
+        int d = homeDay;
+        String name = obj(Store.array(month, "days"), d).optString("name");
+        java.util.regex.Matcher number = java.util.regex.Pattern.compile("(\\d+)\\s*$").matcher(name);
+        screen("pickDay");
+        ui.watchPicker("SEMANA " + (w + 1) + " · DÍA", number.find() ? number.group(1) : title(name),
+                statusLabel(status[w][d]), statusColor(status[w][d]), null,
+                d > 0 ? () -> { homeDay = d - 1; slide = -1; pickDay(); } : null,
+                d < status[w].length - 1 ? () -> { homeDay = d + 1; slide = 1; pickDay(); } : null,
+                R.drawable.ic_play, "Empezar " + name, () -> { week = w; day = d; start(); });
+        ui.slideIn(slide); slide = 0;
+    }
+
+    private static int planNumber(String name) {
+        java.util.regex.Matcher number = java.util.regex.Pattern.compile("\\d+").matcher(name);
+        try { return number.find() ? Integer.parseInt(number.group()) : Integer.MAX_VALUE; }
+        catch (NumberFormatException e) { return Integer.MAX_VALUE; }
+    }
+
+    private static String statusLabel(int status) { return status == 2 ? "Completado" : status == 1 ? "En curso" : "Sin empezar"; }
+    private static int statusColor(int status) { return status == 2 ? TrainingUi.GREEN : status == 1 ? TrainingUi.ACCENT : TrainingUi.MUTED; }
+
+    /** "DÍA 2" → "Día 2", for a calmer display line. */
+    private static String title(String name) {
+        String lower = name.toLowerCase(Locale.getDefault());
+        return lower.isEmpty() ? lower : lower.substring(0, 1).toUpperCase(Locale.getDefault()) + lower.substring(1);
+    }
+
+    private void phoneHome() {
+        screen("home");
+        if (plans().length() == 0) {
+            ui.flex();
+            centered(ui.text("MI ENTRENAMIENTO", 12, TrainingUi.ACCENT, true));
+            centered(ui.text("Importá tu plan", 32, TrainingUi.TEXT, true));
+            centered(ui.text("Elegí el Excel de tu entrenador para empezar.", 15, TrainingUi.MUTED, false));
+            ui.flex();
+            ui.primary("Importar plan · Excel", this::importPlan);
+            return;
+        }
+        JSONObject session = active();
+        // While a session is open, browsing starts from its plan, week and day.
+        if (session != null && selectedPlan == null && !session.optString("planName").isEmpty()) selectedPlan = session.optString("planName");
         plan = PlanProgress.latest(plans());
-        if (selectedPlan != null) {
+        if (selectedPlan != null)
             for (int i = 0; i < plans().length(); i++)
                 if (obj(plans(), i).optString("name").equals(selectedPlan)) { plan = i; break; }
-        }
         JSONObject month = obj(plans(), plan);
         selectedPlan = month.optString("name");
-        ui.gap(16);
-        ui.eyebrow("TU MES");
-        ui.button(selectedPlan + "  ▾", false, () -> {
-            String[] names = new String[plans().length()];
-            for (int i = 0; i < names.length; i++) names[i] = obj(plans(), i).optString("name");
-            choices("Elegí el mes / plan", names, n -> { selectedPlan = names[n]; week = 0; home(); });
-        });
-        int weeks = PlanProgress.weeks(month);
-        week = Math.max(0, Math.min(week, weeks - 1));
+        ui.header(selectedPlan, this::pickPlan, R.drawable.ic_history, "Historial", this::history);
         JSONArray days = Store.array(month, "days");
-        ui.muted("Cada segmento representa un día, en orden.");
-        // Two columns keep week labels readable on narrow phones and at larger font sizes.
-        LinearLayout row = null;
+        int weeks = PlanProgress.weeks(month);
+        if (weeks == 0 || days.length() == 0) {
+            ui.flex(); centered(ui.text("Este plan no tiene días para entrenar.", 15, TrainingUi.MUTED, false)); ui.flex();
+            return;
+        }
+        int[][] status = new int[weeks][days.length()];
+        int[] weekStatus = new int[weeks];
         for (int w = 0; w < weeks; w++) {
-            if (w % 2 == 0) {
-                row = ui.row();
-                ui.body.addView(row, new LinearLayout.LayoutParams(-1, -2));
-            }
-            int selectedWeek = w;
-            int[] status = new int[days.length()];
-            for (int d = 0; d < days.length(); d++) {
-                JSONObject entry = obj(days, d);
-                int count = PlanProgress.completed(state, month, entry, w);
-                int total = Store.array(entry, "exercises").length();
-                status[d] = total > 0 && count == total ? 2 : count > 0 ? 1 : 0;
-            }
-            ui.weekButton(row, w + 1, w == week, status, () -> { week = selectedWeek; home(); });
+            for (int d = 0; d < days.length(); d++) status[w][d] = PlanProgress.dayStatus(state, month, obj(days, d), w);
+            weekStatus[w] = PlanProgress.weekStatus(status[w]);
         }
-        ui.muted("Verde: completo · Amarillo: parcial · Gris: sin ejercicios completos");
-        ui.text("Semana " + (week + 1), 22, TrainingUi.TEXT, true);
-        for (int d = 0; d < days.length(); d++) {
-            int selectedDay = d;
-            JSONObject entry = obj(days, d);
-            int count = PlanProgress.completed(state, month, entry, week);
-            int total = Store.array(entry, "exercises").length();
-            String status = total > 0 && count == total ? "Completo" : count > 0 ? "Parcial" : "Pendiente";
-            ui.button(entry.optString("name") + " · " + count + "/" + total + " · " + status, false, () -> {
-                if (active() != null) {
-                    Toast.makeText(this, "Continuá o finalizá la sesión en curso antes de empezar otra.", Toast.LENGTH_LONG).show();
-                    return;
-                }
-                day = selectedDay; start();
-            });
+        int activeDay = -1;
+        if (session != null && session.optString("planName", selectedPlan).equals(selectedPlan))
+            for (int i = 0; i < days.length(); i++)
+                if (obj(days, i).optString("name").equals(session.optString("name"))) { activeDay = i; break; }
+        if (homeWeek < 0 || homeWeek >= weeks) {
+            homeWeek = activeDay >= 0 ? Math.max(0, Math.min(weeks - 1, session.optInt("week") - 1)) : PlanProgress.current(weekStatus);
+            homeDay = -1;
         }
-        if (weeks == 0 || days.length() == 0) ui.muted("Este plan no tiene días para entrenar.");
+        if (homeDay < 0 || homeDay >= days.length())
+            homeDay = activeDay >= 0 && homeWeek == session.optInt("week") - 1 ? activeDay : PlanProgress.current(status[homeWeek]);
+        int w = homeWeek, d = homeDay;
+        boolean inSession = activeDay == d && session.optInt("week") == w + 1;
+        ui.flex();
+        ui.switcher(null, 0, "Semana " + (w + 1), false, null, 0, "Semana",
+                w > 0 ? () -> { homeWeek = w - 1; homeDay = -1; home(); } : null,
+                w < weeks - 1 ? () -> { homeWeek = w + 1; homeDay = -1; home(); } : null);
+        ui.segments(status[w], d);
+        ui.gap(48);
+        JSONObject entry = obj(days, d);
+        JSONArray exercises = Store.array(entry, "exercises");
+        int count = PlanProgress.completed(state, month, entry, w);
+        String detail; int detailColor;
+        if (inSession) { detail = completed(items()) + " de " + total(items()) + " series"; detailColor = TrainingUi.MUTED; }
+        else if (status[w][d] == 2) { detail = "✓  Completado"; detailColor = TrainingUi.ACCENT; }
+        else if (status[w][d] == 1) { detail = count + " de " + exercises.length() + " ejercicios"; detailColor = TrainingUi.MUTED; }
+        else { detail = "Sin empezar"; detailColor = TrainingUi.MUTED; }
+        ui.switcher(inSession ? "SESIÓN EN CURSO" : null, TrainingUi.ACCENT, entry.optString("name"), true, detail, detailColor, "Día",
+                d > 0 ? () -> { homeDay = d - 1; home(); } : null,
+                d < days.length() - 1 ? () -> { homeDay = d + 1; home(); } : null);
+        if (inSession) {
+            ui.gap(12);
+            ui.progress(completed(items()), total(items()));
+        }
+        ui.gap(inSession ? 8 : 20);
+        StringBuilder names = new StringBuilder();
+        for (int i = 0; i < Math.min(6, exercises.length()); i++)
+            names.append(i > 0 ? "\n" : "").append(obj(exercises, i).optString("name"));
+        if (exercises.length() > 6) names.append("\n+ ").append(exercises.length() - 6).append(" más");
+        TextView list = centered(ui.text(names.toString(), 14, TrainingUi.MUTED, false));
+        list.setLineSpacing(ui.dp(6), 1f);
+        ui.flex();
+        if (session != null) {
+            // Only one session at a time: the action always returns to the open one.
+            ui.primary(inSession ? "Continuar sesión" : "Continuar " + session.optString("name") + " · S" + session.optInt("week"), this::workout);
+            return;
+        }
+        String action = status[w][d] == 2 ? "Repetir" : status[w][d] == 1 ? "Seguir" : "Empezar";
+        ui.primary(action + " · " + entry.optString("name"), () -> { week = w; day = d; start(); });
+    }
+
+    private TextView centered(TextView text) { text.setGravity(Gravity.CENTER); return text; }
+
+    private void pickPlan() {
+        String[] names = new String[plans().length() + 1];
+        for (int i = 0; i < plans().length(); i++) names[i] = obj(plans(), i).optString("name");
+        names[names.length - 1] = "Importar otro Excel…";
+        choices("Tu plan", names, n -> {
+            if (n == names.length - 1) { importPlan(); return; }
+            selectedPlan = names[n]; homeWeek = -1; homeDay = -1; home();
+        });
     }
 
     private void importPlan() {
@@ -215,7 +391,7 @@ public class MainActivity extends Activity {
         super.onActivityResult(request, result, data);
         if (request != 1 || result != RESULT_OK || data == null) return;
         try (java.io.InputStream in = getContentResolver().openInputStream(data.getData())) {
-            state.put("plans", Workbook.parse(in)); selectedPlan = null; week = 0; persist(); home();
+            state.put("plans", Workbook.parse(in)); selectedPlan = null; homeWeek = -1; homeDay = -1; persist(); home();
             Toast.makeText(this, "Plan importado", Toast.LENGTH_SHORT).show();
         } catch (Exception e) { error(e); }
     }
@@ -254,6 +430,7 @@ public class MainActivity extends Activity {
             state.put("active", new JSONObject().put("name", selectedDay.optString("name")).put("week", week + 1)
                     .put("planName", obj(plans(), plan).optString("name"))
                     .put("started", System.currentTimeMillis()).put("items", list).put("index", 0));
+            homeWeek = -1; homeDay = -1;
             persist(); workout();
         } catch (Exception e) { error(e); }
     }
@@ -278,47 +455,61 @@ public class MainActivity extends Activity {
         int done = Store.array(e, "done").length(), sets = e.optInt("sets");
         boolean finished = done >= sets || e.optBoolean("closed");
         if (watch) {
-            ui.watchExercise(e.optString("name"), value(e, "reps"), value(e, "load"),
-                    done, sets, completed(list), total(list), finished,
-                    () -> moveTo((exercise + list.length() - 1) % list.length()),
-                    this::completeSet, () -> moveTo((exercise + 1) % list.length()), this::undoSet);
-            ui.button("Descansar · " + preferredRest() + " s", false, this::startRest);
-            if (!finished) ui.button("Terminar serie", false, this::closeExercise);
-            ui.button("Modificar carga", false, () -> editLoad(e));
-            ui.button("Más opciones", false, this::options);
+            watchFace();
+            // Dragging left reveals the history, which follows the finger as a preview.
+            ui.swipeForward(this::historyPreview, this::history);
+            ui.slideIn(slide); slide = 0; justCompleted = -1;
             return;
-        } else {
-            ui.eyebrow(active().optString("name").toUpperCase(Locale.getDefault()) + " · SEMANA " + active().optInt("week"));
-            ui.muted("Ejercicio " + (exercise + 1) + " de " + list.length());
-            ui.progress(completed(list), total(list));
-            ui.title(e.optString("name"));
-            ui.muted(finished ? "Ejercicio cerrado. " + done + " de " + sets + " series realizadas." : "Concentrate en esta serie. Vos marcás el ritmo.");
-            ui.metrics(value(e, "reps"), value(e, "load"));
-            ui.eyebrow(finished ? "EJERCICIO COMPLETO" : "SERIE " + (done + 1) + " DE " + sets);
-            for (int i = 0; i < sets; i++) {
-                LinearLayout row = ui.row();
-                row.setPadding(ui.dp(16), ui.dp(14), ui.dp(16), ui.dp(14));
-                row.setBackground(ui.background(TrainingUi.SURFACE, 16));
-                TextView name = ui.label("Serie " + (i + 1), 16, TrainingUi.TEXT, i == done);
-                row.addView(name, new LinearLayout.LayoutParams(0, -2, 1));
-                row.addView(ui.label(i < done ? "✓  Lista" : finished ? "Sin realizar" : i == done ? "Ahora" : "Pendiente", 14,
-                        i <= done ? TrainingUi.ACCENT : TrainingUi.MUTED, false));
-                LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
-                params.bottomMargin = ui.dp(6);
-                ui.body.addView(row, params);
-            }
-            ui.gap(16);
         }
-        String action = !finished ? (watch ? "Completar serie" : "✓  Completar serie")
-                : completed(list) >= total(list) ? (watch ? "Terminar" : "Finalizar sesión")
-                : (watch ? "Siguiente" : "Siguiente ejercicio");
+        exercisePage(exercise, true);
+        String action = !finished ? "✓  Completar serie"
+                : completed(list) >= total(list) ? "Finalizar sesión" : "Siguiente ejercicio";
         ui.primary(action, !finished ? this::completeSet : completed(list) >= total(list) ? this::finishSession : this::nextExercise);
-        if (!watch) {
-            ui.button("Ver ejercicios · " + list.length(), false, this::exercises);
-            ui.button("Descanso · " + preferredRest() + " s", false, this::startRest);
-            ui.button("Video y ajustes", false, this::options);
-        } else ui.button("Más opciones", false, this::options);
+        if (list.length() > 1) {
+            int previous = (exercise + list.length() - 1) % list.length(), next = (exercise + 1) % list.length();
+            // A drag already shows the destination page, so it settles without a second slide.
+            ui.pager(() -> exercisePage(previous, false), () -> exercisePage(next, false),
+                    () -> moveTo(previous, 0), () -> moveTo(next, 0));
+        }
+        ui.slideIn(slide); slide = 0; justCompleted = -1;
     }
+
+    /** Watch exercise face for the current exercise, with its action grid below. */
+    private void watchFace() {
+        JSONArray list = items();
+        JSONObject e = current();
+        int done = Store.array(e, "done").length(), sets = e.optInt("sets");
+        boolean finished = done >= sets || e.optBoolean("closed");
+        ui.watchExercise(e.optString("name"), value(e, "reps"), value(e, "load"),
+                done, sets, completed(list), total(list), finished,
+                this::previousExercise, this::completeSet, this::followingExercise, this::undoSet,
+                preferredRest() + " s", this::startRest, this::closeExercise, () -> edit(e), this::options);
+    }
+
+    private void historyPreview() {
+        ui.body.setPadding(ui.dp(24), ui.dp(22), ui.dp(24), ui.dp(40));
+        historyContent();
+    }
+
+    /** Phone exercise page; non-live pages are previews shown while swiping. */
+    private void exercisePage(int index, boolean live) {
+        JSONArray list = items();
+        JSONObject e = obj(list, index);
+        int done = Store.array(e, "done").length(), sets = e.optInt("sets");
+        boolean finished = done >= sets || e.optBoolean("closed");
+        ui.topBar(active().optString("name").toUpperCase(Locale.getDefault()) + " · SEMANA " + active().optInt("week"), this::home, this::options);
+        ui.progress(completed(list), total(list));
+        ui.title(e.optString("name"));
+        ui.metrics(value(e, "reps"), value(e, "load"), () -> edit(e));
+        ui.eyebrow(finished ? "EJERCICIO COMPLETO" : "SERIE " + (done + 1) + " DE " + sets);
+        ui.setRow(done, sets, finished, live ? justCompleted : -1, this::undoSet);
+        ui.pair(ui.iconAction(R.drawable.ic_video, "Video", () -> video(e)),
+                ui.iconAction(R.drawable.ic_timer, "Descanso", this::startRest));
+        ui.button("Ver ejercicios · " + list.length(), false, this::exercises);
+    }
+
+    private void previousExercise() { JSONArray list = items(); moveTo((exercise + list.length() - 1) % list.length(), -1); }
+    private void followingExercise() { moveTo((exercise + 1) % items().length(), 1); }
 
     private void completeSet() {
         if (active() == null) return;
@@ -329,6 +520,7 @@ public class MainActivity extends Activity {
         try {
             done.put(new JSONObject().put("at", System.currentTimeMillis()));
             e.put("done", done);
+            justCompleted = done.length() - 1;
             if (done.length() >= e.optInt("sets")) {
                 e.put("closed", true); e.put("awaitingFeeling", true);
             }
@@ -386,22 +578,11 @@ public class MainActivity extends Activity {
                 int next = (index + offset) % list.length();
                 JSONObject item = obj(list, next);
                 if (!item.optBoolean("closed") && Store.array(item, "done").length() < item.optInt("sets")) {
-                    moveTo(next); return;
+                    moveTo(next, 1); return;
                 }
             }
         }
         workout();
-    }
-
-    private void editLoad(JSONObject e) {
-        LinearLayout box = ui.column();
-        box.setPadding(ui.dp(24), ui.dp(8), ui.dp(24), 0);
-        EditText load = field(box, "Carga (con unidad)", e.optString("load"));
-        new AlertDialog.Builder(this).setTitle("Modificar carga").setView(box)
-                .setNegativeButton("Cancelar", null).setPositiveButton("Guardar", (dialog, n) -> {
-                    try { e.put("load", load.getText().toString()); persist(); workout(); }
-                    catch (Exception ex) { error(ex); }
-                }).show();
     }
 
     private void haptic(boolean finished) {
@@ -418,25 +599,34 @@ public class MainActivity extends Activity {
         for (int offset = 1; offset <= list.length(); offset++) {
             int next = (exercise + offset) % list.length();
             JSONObject item = obj(list, next);
-            if (!item.optBoolean("closed") && Store.array(item, "done").length() < item.optInt("sets")) { moveTo(next); return; }
+            if (!item.optBoolean("closed") && Store.array(item, "done").length() < item.optInt("sets")) { moveTo(next, 1); return; }
         }
         finishSession();
     }
-    private void moveTo(int index) {
-        try { cancelRest(); active().put("index", index); persist(); workout(); }
+    private void moveTo(int index) { moveTo(index, Integer.compare(index, exercise)); }
+    private void moveTo(int index, int direction) {
+        try {
+            cancelRest(); slide = direction; justCompleted = -1; active().put("index", index);
+            workout();
+            // Save and sync after the new page is drawn so the transition does not stall.
+            getWindow().getDecorView().post(this::persist);
+        }
         catch (Exception e) { error(e); }
     }
     private void exercises() {
         if (active() == null) { home(); return; }
         screen("exercises");
-        ui.eyebrow("TU SESIÓN"); ui.title("Ejercicios");
+        if (!watch) ui.topBar("TU SESIÓN", this::workout); else ui.eyebrow("TU SESIÓN");
+        ui.title("Ejercicios");
         JSONArray list = items();
         for (int i = 0; i < list.length(); i++) {
             JSONObject e = obj(list, i); int index = i;
             int done = Store.array(e, "done").length();
-            ui.button((done >= e.optInt("sets") ? "✓  " : (i + 1) + ". ") + e.optString("name") + "\n" + done + "/" + e.optInt("sets") + " series", false, () -> moveTo(index));
+            String label = (done >= e.optInt("sets") ? "✓  " : (i + 1) + ". ") + e.optString("name") + "\n" + done + "/" + e.optInt("sets") + " series";
+            if (done >= e.optInt("sets")) ui.doneButton(label, () -> moveTo(index));
+            else ui.button(label, false, () -> moveTo(index));
         }
-        ui.button("Volver al ejercicio", false, this::workout);
+        if (watch) ui.button("Volver al ejercicio", false, this::workout);
     }
     private void options() {
         if (active() == null || items().length() == 0) { home(); return; }
@@ -446,19 +636,26 @@ public class MainActivity extends Activity {
             ui.overlay(() -> page = "workout");
         } else screen("options");
         JSONObject e = current();
-        ui.eyebrow("EN TUS MANOS"); ui.title(watch ? "Opciones" : "Tu ejercicio");
-        if (watch) ui.muted(e.optString("name"));
-        ui.button("Volver al ejercicio", true, () -> { if (!ui.closeOverlay()) workout(); });
+        if (watch) {
+            // Only the two session-level actions; a right drag slides the panel away to the exercise.
+            ui.body.setGravity(Gravity.CENTER_VERTICAL);
+            ui.title("Opciones");
+            ui.gap(8);
+            Button finish = ui.action("Terminar sesión", false, this::finishSession);
+            finish.setTextColor(TrainingUi.DANGER);
+            LinearLayout.LayoutParams params = new LinearLayout.LayoutParams(-1, -2);
+            params.bottomMargin = ui.dp(8);
+            ui.body.addView(finish, params);
+            ui.button("Ir al inicio", false, () -> { ui.closeOverlay(); home(); });
+            return;
+        }
+        ui.topBar("EN TUS MANOS", this::workout); ui.title("Opciones"); ui.muted(e.optString("name"));
         ui.button("Ver ejercicios", false, this::exercises);
         if (Store.array(e, "done").length() > 0) ui.button("Deshacer último set", false, this::undoSet);
         if (e.optBoolean("closed")) ui.button("Reabrir ejercicio", false, () -> {
             e.remove("closed"); persist(); workout();
         });
         ui.button("¿Cómo me sentí?", false, () -> effort(e, () -> { persist(); workout(); }));
-        if (!watch) {
-            ui.button("Ver video", false, () -> video(e));
-            ui.button("Editar reps, carga y video", false, () -> edit(e));
-        }
         ui.gap(12);
         Button finish = ui.action("Finalizar sesión", false, this::finishSession);
         finish.setTextColor(TrainingUi.DANGER);
@@ -480,7 +677,7 @@ public class MainActivity extends Activity {
     private void showRest() {
         if (active() == null || restExercise != active().optInt("index")) { cancelRest(); workout(); return; }
         screen("rest");
-        ui.eyebrow("RECUPERÁ EL AIRE");
+        if (!watch) ui.topBar("RECUPERÁ EL AIRE", this::continueAfterExercise); else ui.eyebrow("RECUPERÁ EL AIRE");
         TextView timer = ui.text("", watch ? 46 : 80, TrainingUi.TEXT, true);
         timer.setGravity(Gravity.CENTER);
         timer.setTypeface(android.graphics.Typeface.create("sans-serif-light", android.graphics.Typeface.NORMAL));
@@ -489,7 +686,7 @@ public class MainActivity extends Activity {
         TextView status = ui.text("", watch ? 13 : 20, TrainingUi.MUTED, false);
         status.setGravity(Gravity.CENTER);
         JSONObject e = current();
-        ui.primary(watch ? "Seguir" : "Volver al ejercicio", this::continueAfterExercise);
+        ui.primary(watch ? "Seguir" : "Seguir entrenando", this::continueAfterExercise);
         ui.muted(restAdvance ? "Después: siguiente ejercicio pendiente" : "Después: " + e.optString("name")
                 + " · set " + Math.min(e.optInt("sets"), Store.array(e, "done").length() + 1));
         ui.button("+30 segundos", false, () -> {
@@ -562,12 +759,23 @@ public class MainActivity extends Activity {
                     try {
                         JSONObject session = active(); session.put("finished", System.currentTimeMillis());
                         JSONArray history = Store.array(state, "history"); history.put(session);
-                        state.put("history", history); state.remove("active"); cancelRest(); persist(); home();
+                        state.put("history", history); state.remove("active"); cancelRest(); persist();
+                        homeWeek = -1; homeDay = -1; home();
                     } catch (Exception e) { error(e); }
                 })).show();
     }
     private void history() {
-        screen("history"); ui.eyebrow("CADA SESIÓN CUENTA"); ui.title("Tu historial");
+        screen("history");
+        boolean session = watch && active() != null && items().length() > 0;
+        // Dragging right brings the exercise back into view while the history slides away.
+        if (session) ui.swipeBackPreview(this::watchFace);
+        historyContent();
+        if (watch) ui.button(session ? "Volver al ejercicio" : "Volver al inicio", false, this::goBack);
+    }
+
+    private void historyContent() {
+        if (!watch) ui.topBar("CADA SESIÓN CUENTA", this::home); else ui.eyebrow("CADA SESIÓN CUENTA");
+        ui.title("Tu historial");
         JSONArray history = Store.array(state, "history");
         if (history.length() == 0) ui.muted("Tu primera sesión te espera. Cuando termines, la vas a encontrar acá.");
         for (int i = history.length() - 1; i >= 0; i--) {
@@ -575,48 +783,61 @@ public class MainActivity extends Activity {
             String date = android.text.format.DateFormat.getDateFormat(this).format(new Date(session.optLong("finished")));
             String detail = date + " · Semana " + session.optInt("week");
             JSONArray list = Store.array(session, "items");
+            LinearLayout card = null;
             if (watch) { ui.text(session.optString("name"), 18, TrainingUi.TEXT, true); ui.muted(detail); ui.muted(completed(list) + " series · Sensación " + feelingLabel(session)); }
             else {
-                LinearLayout card = ui.card();
+                card = ui.card();
                 ui.cardText(card, detail, 13, TrainingUi.MUTED, false);
                 ui.cardText(card, session.optString("name"), 22, TrainingUi.TEXT, true);
                 ui.cardText(card, completed(list) + " series · Sensación " + feelingLabel(session), 15, TrainingUi.ACCENT, false);
             }
+            for (int j = 0; j < list.length(); j++) {
+                JSONObject item = obj(list, j);
+                int done = Math.min(item.optInt("sets"), Store.array(item, "done").length());
+                ui.exerciseChip(card, item.optString("name"), done, item.optInt("sets"), done >= item.optInt("sets") && done > 0);
+            }
+            if (watch) ui.gap(12);
         }
-        ui.button("Volver al inicio", false, this::home);
     }
     private void video(JSONObject e) {
         String url = e.optString("video");
-        if (url.isEmpty()) { Toast.makeText(this, "Agregá un enlace en Editar reps, carga y video", Toast.LENGTH_LONG).show(); return; }
+        if (url.trim().isEmpty()) { edit(e); return; }
         try {
             Uri uri = Uri.parse(url);
             if (!"https".equalsIgnoreCase(uri.getScheme()) && !"http".equalsIgnoreCase(uri.getScheme())) throw new IllegalArgumentException("Usá un enlace http o https");
             startActivity(new Intent(Intent.ACTION_VIEW, uri));
         } catch (Exception ex) { error(ex); }
     }
-    private void edit(JSONObject e) {
-        LinearLayout box = ui.column(); box.setPadding(ui.dp(24), ui.dp(8), ui.dp(24), 0);
-        EditText reps = field(box, "Repeticiones", e.optString("reps"));
-        EditText load = field(box, "Carga (con unidad)", e.optString("load"));
-        EditText video = field(box, "Video · https://…", e.optString("video"));
-        video.setInputType(android.text.InputType.TYPE_CLASS_TEXT | android.text.InputType.TYPE_TEXT_VARIATION_URI);
-        new AlertDialog.Builder(this).setTitle("Editar esta sesión").setView(box).setNegativeButton("Cancelar", null)
-                .setPositiveButton("Guardar", (dialog, n) -> {
-                    try { e.put("reps", reps.getText().toString()); e.put("load", load.getText().toString()); e.put("video", video.getText().toString()); persist(); workout(); }
-                    catch (Exception ex) { error(ex); }
-                }).show();
+    private void edit(JSONObject e) { editExercise(); }
+
+    /** Full-screen editor for the current exercise's reps, load and video. */
+    private void editExercise() {
+        if (active() == null || items().length() == 0) { home(); return; }
+        JSONObject e = current();
+        screen("edit");
+        if (!watch) ui.topBar("EDITAR EJERCICIO", this::workout); else ui.eyebrow("EDITAR");
+        ui.title(e.optString("name"));
+        if (!watch) ui.muted("Los cambios se aplican a esta sesión.");
+        ui.gap(watch ? 4 : 8);
+        int text = android.text.InputType.TYPE_CLASS_TEXT;
+        EditText reps = ui.field("REPETICIONES", e.optString("reps"), "Ej. 10 o 8-10", text, watch ? 0 : 1);
+        EditText load = ui.field("CARGA", e.optString("load"), "Ej. 20 kg", text, watch ? 0 : 2.5);
+        EditText video = watch ? null : ui.field("VIDEO", e.optString("video"), "https://…",
+                text | android.text.InputType.TYPE_TEXT_VARIATION_URI, 0);
+        Runnable save = () -> {
+            try {
+                e.put("reps", reps.getText().toString().trim()); e.put("load", load.getText().toString().trim());
+                if (video != null) e.put("video", video.getText().toString().trim());
+                hideKeyboard(); persist(); workout();
+            } catch (Exception ex) { error(ex); }
+        };
+        ui.primary("Guardar cambios", save);
+        if (watch) ui.button("Cancelar", false, this::workout);
     }
-    private EditText field(LinearLayout box, String name, String value) {
-        box.addView(ui.label(name, 13, TrainingUi.MUTED, false));
-        EditText input = new EditText(this); input.setText(value); input.setContentDescription(name);
-        box.addView(input); return input;
-    }
-    @Override public void onBackPressed() {
-        if (page.equals("options") && ui.closeOverlay()) return;
-        if (page.equals("feeling")) { dismissFeeling(); return; }
-        if (page.equals("rest") || page.equals("restOffer")) continueAfterExercise();
-        else if (page.equals("options") || page.equals("exercises") || page.equals("feeling")) workout();
-        else if (!page.equals("home")) home();
-        else super.onBackPressed();
+
+    private void hideKeyboard() {
+        View focus = getCurrentFocus();
+        if (focus != null) ((android.view.inputmethod.InputMethodManager) getSystemService(INPUT_METHOD_SERVICE))
+                .hideSoftInputFromWindow(focus.getWindowToken(), 0);
     }
 }
